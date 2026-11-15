@@ -1,0 +1,1958 @@
+/*
+ * Copyright 2026 Turing Software LLC
+ * SPDX-License-Identifier: MIT
+ */
+
+#include "npt_context.h"
+#include "npt_job.h"
+
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
+#include <unistd.h>
+#ifndef _WIN32
+#include <sys/mman.h>
+#endif
+
+#include "npt_com.h"
+#include "npt_dispatch.h"
+#include "npt_event.h"
+#include "npt_feedback.h"
+#include "npt_heap12.h"
+#include "npt_hostmem.h"
+#include "npt_overrides.h"
+#include "npt_profile.h"
+#include "npt_queue.h"
+#include "npt_resource.h"
+#include "npt_ring.h"
+#include "npt_shared.h"
+#include "neptune-protocol/npt_protocol_host_dispatch.h"
+#include "util/anon_file.h"
+#include "util/os_file.h"
+#define XXH_INLINE_ALL
+#include "util/xxhash.h"
+
+static uint32_t
+hash_uint32(const void *key)
+{
+   return *(const uint32_t *)key;
+}
+
+static bool
+equal_uint32(const void *a, const void *b)
+{
+   return *(const uint32_t *)a == *(const uint32_t *)b;
+}
+
+/* Pointer-based IDs share low zero-bits on aligned objects; XXH32
+ * spreads them uniformly. */
+static uint32_t
+hash_uint64(const void *key)
+{
+   return XXH32(key, sizeof(uint64_t), 0);
+}
+
+static bool
+equal_uint64(const void *a, const void *b)
+{
+   return *(const uint64_t *)a == *(const uint64_t *)b;
+}
+
+static void
+npt_context_ring_monitor_fini(struct npt_context *ctx);
+
+static void
+npt_resource_free(struct npt_resource *res)
+{
+   switch (res->fd_type) {
+   case VIRGL_RESOURCE_FD_SHM:
+      if (res->u.data && !res->iov_owned)
+         munmap(res->u.data, res->size);
+      if (res->u.fd >= 0)
+         close(res->u.fd);
+      break;
+   case VIRGL_RESOURCE_FD_DMABUF:
+   case VIRGL_RESOURCE_FD_OPAQUE:
+      if (res->u.fd >= 0)
+         close(res->u.fd);
+      break;
+   default:
+      break;
+   }
+
+   free(res);
+}
+
+static void
+npt_context_free_resource(struct hash_entry *entry)
+{
+   npt_resource_free(entry->data);
+}
+
+void
+npt_context_free_detached_resource(struct npt_resource *res)
+{
+   npt_resource_free(res);
+}
+
+struct npt_resource *
+npt_context_pin_shm_resource(struct npt_context *ctx, uint32_t res_id)
+{
+   mtx_lock(&ctx->resource_mutex);
+   const struct hash_entry *entry =
+      _mesa_hash_table_search(ctx->resource_table, &res_id);
+   struct npt_resource *res = entry ? entry->data : NULL;
+   if (res && res->fd_type == VIRGL_RESOURCE_FD_SHM && res->u.data)
+      res->pin_count++;
+   else
+      res = NULL;
+   mtx_unlock(&ctx->resource_mutex);
+
+   return res;
+}
+
+void
+npt_context_unpin_resource(struct npt_context *ctx, struct npt_resource *res)
+{
+   mtx_lock(&ctx->resource_mutex);
+   assert(res->pin_count > 0);
+   res->pin_count--;
+   const bool free_now = res->zombie && res->pin_count == 0;
+   const uint32_t res_id = res->res_id;
+   mtx_unlock(&ctx->resource_mutex);
+
+   if (free_now) {
+      npt_log("last pin on destroyed res %u dropped; completing deferred "
+              "munmap", res_id);
+      npt_context_free_detached_resource(res);
+   }
+}
+
+/* Overrides are set only where the default dispatcher cannot cope:
+ * top-level functions (no _self for dlsym to bind against),
+ * shared-HANDLE rejection, and feedback lifecycle hooks.  All other
+ * dispatch slots stay NULL and fall through. */
+static void
+npt_context_init_dispatch(struct npt_context *ctx)
+{
+   struct npt_dispatch_context *d = &ctx->dispatch;
+   memset(d, 0, sizeof(*d));
+
+   d->data = ctx;
+
+   d->decoder = &ctx->decoder;
+   d->encoder = &ctx->encoder;
+
+   d->toplevel_dispatch_overrides = &npt_toplevel_overrides;
+   d->idxgiresource_dispatch_overrides = &npt_idxgiresource_overrides;
+   d->idxgiresource1_dispatch_overrides = &npt_idxgiresource1_overrides;
+   d->id3d11device_dispatch_overrides = &npt_id3d11device_overrides;
+   d->id3d11device1_dispatch_overrides = &npt_id3d11device1_overrides;
+   d->id3d11device5_dispatch_overrides = &npt_id3d11device5_overrides;
+   d->id3d11fence_dispatch_overrides = &npt_id3d11fence_overrides;
+   d->id3d12device_dispatch_overrides = &npt_id3d12device_overrides;
+   d->id3d11devicecontext_dispatch_overrides = &npt_query_dc_overrides;
+   d->id3d11devicecontext4_dispatch_overrides = &npt_fence_dc4_overrides;
+   d->id3d12commandqueue_dispatch_overrides =
+      &npt_id3d12commandqueue_overrides;
+   d->id3d12fence_dispatch_overrides = &npt_id3d12fence_overrides;
+}
+
+/* `id` is the guest-minted handle; `host_ptr` the host-library pointer
+ * for the interface the id was registered as; `identity` the object
+ * itself (its IUnknown), shared by every id registered for it.  `regs`
+ * counts the registrations the id stands for -- its first, plus one per
+ * canonical answer that named it again -- each holding one host-library
+ * ref and each dropped by one COM_RELEASE.  A failed Create's record
+ * has no host_ptr and no identity. */
+struct npt_object {
+   uint64_t id;
+   npt_object_type type;
+   void *host_ptr;
+   void *identity;
+   uint32_t regs;
+};
+
+/* Every id registered for one host object, keyed by its IUnknown.  The
+ * primary is the id QueryInterface(IID_IUnknown) answers with: the
+ * object's first registration while it lives, then the oldest left. */
+struct npt_identity {
+   void *unknown;
+   uint64_t primary_id;
+   uint64_t *ids;
+   uint32_t count;
+   uint32_t cap;
+};
+
+/* The object behind an interface pointer, as COM defines it. */
+static void *
+npt_object_identity_of(void *obj)
+{
+   void *unknown = NULL;
+   if (NPT_FAILED(npt_com_query_interface(obj, &NPT_IID_IUnknown, &unknown)) ||
+       !unknown)
+      return obj;
+   npt_com_release(unknown);
+   return unknown;
+}
+
+/* Caller holds object_mutex. */
+static struct npt_identity *
+npt_identity_find_locked(struct npt_context *ctx, void *unknown)
+{
+   struct hash_entry *entry =
+      _mesa_hash_table_search(ctx->identity_table, unknown);
+   return entry ? entry->data : NULL;
+}
+
+/* Caller holds object_mutex.  Records `id` as a registration of the
+ * object `unknown`; the first one becomes the primary. */
+static void
+npt_identity_add_locked(struct npt_context *ctx, void *unknown, uint64_t id)
+{
+   struct npt_identity *ident = npt_identity_find_locked(ctx, unknown);
+   if (!ident) {
+      ident = calloc(1, sizeof(*ident));
+      if (!ident)
+         return;
+      ident->unknown = unknown;
+      ident->primary_id = id;
+      _mesa_hash_table_insert(ctx->identity_table, ident->unknown, ident);
+   }
+   if (ident->count == ident->cap) {
+      const uint32_t cap = ident->cap ? ident->cap * 2 : 4;
+      uint64_t *ids = realloc(ident->ids, cap * sizeof(*ids));
+      if (!ids)
+         return;
+      ident->ids = ids;
+      ident->cap = cap;
+   }
+   ident->ids[ident->count++] = id;
+}
+
+/* Caller holds object_mutex.  Forgets `id` as a registration of its
+ * object; the primary moves to the oldest remaining id. */
+static void
+npt_identity_remove_locked(struct npt_context *ctx, const struct npt_object *e)
+{
+   if (!e->identity)
+      return;
+   struct npt_identity *ident = npt_identity_find_locked(ctx, e->identity);
+   if (!ident)
+      return;
+   for (uint32_t i = 0; i < ident->count; i++) {
+      if (ident->ids[i] != e->id)
+         continue;
+      memmove(&ident->ids[i], &ident->ids[i + 1],
+              (ident->count - i - 1) * sizeof(ident->ids[0]));
+      ident->count--;
+      break;
+   }
+   if (ident->count == 0) {
+      struct hash_entry *entry =
+         _mesa_hash_table_search(ctx->identity_table, ident->unknown);
+      if (entry)
+         _mesa_hash_table_remove(ctx->identity_table, entry);
+      free(ident->ids);
+      free(ident);
+      return;
+   }
+   if (ident->primary_id == e->id)
+      ident->primary_id = ident->ids[0];
+}
+
+static uint64_t
+npt_identity_primary_locked(struct npt_context *ctx, const struct npt_object *e)
+{
+   struct npt_identity *ident =
+      e->identity ? npt_identity_find_locked(ctx, e->identity) : NULL;
+   return ident ? ident->primary_id : e->id;
+}
+
+uint64_t npt_context_trace_primary_id(struct npt_context *ctx, uint64_t id)
+{
+   mtx_lock(&ctx->object_mutex);
+   struct hash_entry *entry = _mesa_hash_table_search(ctx->object_table, &id);
+   const uint64_t result = entry ?
+      npt_identity_primary_locked(ctx, entry->data) : 0;
+   mtx_unlock(&ctx->object_mutex);
+   return result;
+}
+
+static bool
+npt_object_type_same_family(npt_object_type a, npt_object_type b)
+{
+   return a > 0 && b > 0 && a < NPT_OBJECT_TYPE_COUNT &&
+          b < NPT_OBJECT_TYPE_COUNT &&
+          npt_object_type_family[a] == npt_object_type_family[b];
+}
+
+/* Steps from `t` to the root of its inheritance chain. */
+static uint32_t
+npt_object_type_depth(npt_object_type t)
+{
+   uint32_t depth = 0;
+   while (t > 0 && t < NPT_OBJECT_TYPE_COUNT && depth < NPT_OBJECT_TYPE_COUNT) {
+      t = npt_object_type_parent[t];
+      depth++;
+   }
+   return depth;
+}
+
+/* Bounded by NPT_OBJECT_TYPE_COUNT so a malformed parent table can't
+ * loop. */
+static bool
+npt_object_type_has_ancestor(npt_object_type t, npt_object_type target)
+{
+   for (uint32_t i = 0; i < (uint32_t)NPT_OBJECT_TYPE_COUNT; i++) {
+      if (t == target)
+         return true;
+      if (t == 0 || t >= NPT_OBJECT_TYPE_COUNT)
+         return false;
+      t = npt_object_type_parent[t];
+   }
+   return false;
+}
+
+static inline uint32_t
+npt_lookup_cache_slot(uint64_t id)
+{
+   /* ids are COM pointers (16-byte aligned) or small monotonic guest
+    * counters.  Fibonacci hashing: the multiply mixes every input bit into
+    * the top bits, so aligned pointers and consecutive counters both spread
+    * evenly across the slots. */
+   return (uint32_t)((id * 0x9E3779B97F4A7C15ull) >>
+                     (64u - NPT_CS_LOOKUP_CACHE_BITS));
+}
+
+/* Caller holds object_mutex.  Raises an entry's type to `type` when
+ * that is more derived (COM objects share one pointer across the tiers
+ * of an interface, so a QI or getter can confirm a higher one). */
+static void
+npt_object_upgrade_type_locked(struct npt_context *ctx, struct npt_object *e,
+                               npt_object_type type)
+{
+   if (e->type == type)
+      return;
+   if (e->type == NPT_OBJECT_TYPE_IUNKNOWN ||
+       npt_object_type_has_ancestor(type, e->type)) {
+      e->type = type;
+      atomic_fetch_add_explicit(&ctx->object_gen[npt_lookup_cache_slot(e->id)],
+                                1, memory_order_release);
+   } else if (type != NPT_OBJECT_TYPE_IUNKNOWN &&
+              !npt_object_type_has_ancestor(e->type, type)) {
+      npt_log("object table: id 0x%016" PRIx64
+              " re-registered with unrelated type %u (was %u)",
+              e->id, (unsigned)type, (unsigned)e->type);
+   }
+}
+
+/* Caller holds object_mutex.  Inserts a new id for `obj`. */
+static struct npt_object *
+npt_object_insert_locked(struct npt_context *ctx, uint64_t id, void *obj,
+                         void *identity, npt_object_type type)
+{
+   struct npt_object *e = calloc(1, sizeof(*e));
+   if (!e)
+      return NULL;
+   e->id = id;
+   e->type = type;
+   e->host_ptr = obj;
+   e->identity = identity;
+   e->regs = 1;
+
+   /* Key points into e->id so the hash key stays valid for e's lifetime. */
+   _mesa_hash_table_insert(ctx->object_table, &e->id, e);
+   npt_identity_add_locked(ctx, identity, id);
+   if (ctx->object_waiters)
+      cnd_broadcast(&ctx->object_cond);
+   return e;
+}
+
+void
+npt_context_register_object(struct npt_context *ctx,
+                            uint64_t id,
+                            void *obj,
+                            npt_object_type type)
+{
+   if (!id || !obj || !type || !ctx || !ctx->object_table)
+      return;
+
+   void *identity = npt_object_identity_of(obj);
+
+   mtx_lock(&ctx->object_mutex);
+   struct hash_entry *entry = _mesa_hash_table_search(ctx->object_table, &id);
+   if (entry)
+      npt_object_upgrade_type_locked(ctx, entry->data, type);
+   else
+      npt_object_insert_locked(ctx, id, obj, identity, type);
+   mtx_unlock(&ctx->object_mutex);
+}
+
+/* Caller holds object_mutex.  The id already registered for `ident`'s
+ * object that can stand in for a `type` interface: one whose type is
+ * in `type`'s family (the same interface at some version) or derives
+ * from `type` (the object's own wrapper serves a base interface).  The
+ * most derived wins, the primary on a tie; `IUNKNOWN` asks for the
+ * primary itself.  NULL when no registered id qualifies. */
+static struct npt_object *
+npt_identity_pick_locked(struct npt_context *ctx,
+                         const struct npt_identity *ident,
+                         npt_object_type type)
+{
+   struct npt_object *best = NULL;
+   uint32_t best_depth = 0;
+   for (uint32_t i = 0; i < ident->count; i++) {
+      struct hash_entry *entry =
+         _mesa_hash_table_search(ctx->object_table, &ident->ids[i]);
+      if (!entry)
+         continue;
+      struct npt_object *e = entry->data;
+      if (!e->host_ptr)
+         continue;
+      if (type == NPT_OBJECT_TYPE_IUNKNOWN) {
+         if (e->id == ident->primary_id)
+            return e;
+         continue;
+      }
+      if (!npt_object_type_same_family(e->type, type) &&
+          !npt_object_type_has_ancestor(e->type, type))
+         continue;
+      const uint32_t depth = npt_object_type_depth(e->type);
+      if (!best || depth > best_depth ||
+          (depth == best_depth && e->id == ident->primary_id)) {
+         best = e;
+         best_depth = depth;
+      }
+   }
+   return best;
+}
+
+/* `identity` is the object `obj` belongs to; NULL asks the pointer. */
+static void
+npt_context_register_canonical_as(struct npt_context *ctx,
+                                  uint64_t id,
+                                  void *obj,
+                                  void *identity,
+                                  npt_object_type type,
+                                  struct npt_wire_object_ref *ref)
+{
+   memset(ref, 0, sizeof(*ref));
+   if (!obj)
+      return;
+   if (!id || !type || !ctx || !ctx->object_table) {
+      npt_com_release(obj);
+      return;
+   }
+
+   if (!identity)
+      identity = npt_object_identity_of(obj);
+
+   mtx_lock(&ctx->object_mutex);
+   struct hash_entry *entry = _mesa_hash_table_search(ctx->object_table, &id);
+   struct npt_object *e = entry ? entry->data : NULL;
+   if (e) {
+      /* The guest reused an id it still holds: another registration of
+       * it. */
+      npt_object_upgrade_type_locked(ctx, e, type);
+      e->regs++;
+   } else {
+      struct npt_identity *ident = npt_identity_find_locked(ctx, identity);
+      e = ident ? npt_identity_pick_locked(ctx, ident, type) : NULL;
+      if (e) {
+         if (npt_object_type_same_family(e->type, type))
+            npt_object_upgrade_type_locked(ctx, e, type);
+         e->regs++;
+      } else {
+         e = npt_object_insert_locked(ctx, id, obj, identity, type);
+      }
+   }
+   /* A registration's ref is released through host_ptr, so a different
+    * pointer's ref moves onto it: an interface a backend mints fresh per
+    * call (a DXGI resource view) has a count of its own. */
+   void *drop = e ? NULL : obj;
+   if (e) {
+      if (e->host_ptr != obj) {
+         npt_com_add_ref(e->host_ptr);
+         drop = obj;
+      }
+      ref->id = e->id;
+      ref->primary_id = npt_identity_primary_locked(ctx, e);
+      ref->type = (uint32_t)e->type;
+   }
+   mtx_unlock(&ctx->object_mutex);
+
+   if (drop)
+      npt_com_release(drop);
+}
+
+void
+npt_context_register_canonical_object(struct npt_context *ctx,
+                                      uint64_t id,
+                                      void *obj,
+                                      npt_object_type type,
+                                      struct npt_wire_object_ref *ref)
+{
+   npt_context_register_canonical_as(ctx, id, obj, NULL, type, ref);
+}
+
+void
+npt_context_register_failed_object(struct npt_context *ctx, uint64_t id)
+{
+   if (!id || !ctx || !ctx->object_table)
+      return;
+
+   mtx_lock(&ctx->object_mutex);
+   if (!_mesa_hash_table_search(ctx->object_table, &id)) {
+      struct npt_object *e = calloc(1, sizeof(*e));
+      if (e) {
+         e->id = id;
+         _mesa_hash_table_insert(ctx->object_table, &e->id, e);
+         if (ctx->object_waiters)
+            cnd_broadcast(&ctx->object_cond);
+      }
+   }
+   mtx_unlock(&ctx->object_mutex);
+   npt_log("object table: Create for id 0x%016" PRIx64 " failed on the "
+           "host; its calls will be dropped", id);
+}
+
+/* Caller holds object_mutex.  Wait (bounded) for `id` to be registered
+ * by another ring: a use decoded here can only have been written after
+ * the guest wrote the Create, so the Create is published on some ring
+ * and will be decoded unless that ring is wedged.  Returns the entry,
+ * or NULL after the timeout / on fatal. */
+static struct npt_object *
+npt_context_await_object_locked(struct npt_context *ctx, uint64_t id)
+{
+   const uint64_t slice_ns = 10ull * 1000 * 1000;
+   /* Longer than any legitimate cross-ring lag by orders of magnitude,
+    * shorter than the guest's GPU timeout, so a ring wedged on a
+    * registration that never comes drops the call before dxgkrnl
+    * declares the device hung. */
+   const uint64_t give_up_ns = 1000ull * 1000 * 1000;
+   uint64_t waited_ns = 0;
+   const struct npt_ring *self = npt_ring_current();
+
+   ctx->object_waiters++;
+   for (;;) {
+      struct hash_entry *entry =
+         _mesa_hash_table_search(ctx->object_table, &id);
+      if (entry || ctx->cs_fatal_error || (self && !self->started)) {
+         ctx->object_waiters--;
+         return entry ? entry->data : NULL;
+      }
+      if (waited_ns >= give_up_ns) {
+         ctx->object_waiters--;
+         npt_log("object table: id 0x%016" PRIx64 " still unregistered "
+                 "after %" PRIu64 " ms; giving up", id,
+                 waited_ns / 1000000);
+         return NULL;
+      }
+      struct timespec ts;
+      timespec_get(&ts, TIME_UTC);
+      ts.tv_nsec += (long)slice_ns;
+      if (ts.tv_nsec >= 1000000000L) {
+         ts.tv_sec += 1;
+         ts.tv_nsec -= 1000000000L;
+      }
+      cnd_timedwait(&ctx->object_cond, &ctx->object_mutex, &ts);
+      waited_ns += slice_ns;
+   }
+}
+
+/* Caller holds object_mutex. */
+static void
+npt_context_unregister_locked(struct npt_context *ctx, struct hash_entry *entry)
+{
+   struct npt_object *e = entry->data;
+   const uint64_t id = e->id;
+   npt_identity_remove_locked(ctx, e);
+   free(e);
+   _mesa_hash_table_remove(ctx->object_table, entry);
+   /* Invalidate this id's slot in every decoder's lookup cache before
+    * the id can be reused by a new object. */
+   atomic_fetch_add_explicit(&ctx->object_gen[npt_lookup_cache_slot(id)],
+                             1, memory_order_release);
+}
+
+void
+npt_context_unregister_object(struct npt_context *ctx, uint64_t id)
+{
+   if (!id || !ctx || !ctx->object_table)
+      return;
+
+   mtx_lock(&ctx->object_mutex);
+   struct hash_entry *entry = _mesa_hash_table_search(ctx->object_table, &id);
+   if (entry)
+      npt_context_unregister_locked(ctx, entry);
+   mtx_unlock(&ctx->object_mutex);
+}
+
+/* Accept on exact match, downcast (registered is a descendant of
+ * expected), upcast (expected is a descendant of registered), or
+ * IUnknown either way.  Upcast is defensive: Create paths can return
+ * a base-interface pointer whose host implementation is most-derived
+ * in the chain.  D3D/DXGI single-inheritance ABI places the derived
+ * vtable at the same physical pointer as the base, so dispatch is
+ * still well defined; unrelated chains still fail. */
+static bool
+npt_object_type_is_compatible(npt_object_type actual,
+                              npt_object_type expected)
+{
+   if (actual == expected)
+      return true;
+   if (expected == NPT_OBJECT_TYPE_IUNKNOWN ||
+       actual == NPT_OBJECT_TYPE_IUNKNOWN)
+      return true;
+   return npt_object_type_has_ancestor(actual, expected) ||
+          npt_object_type_has_ancestor(expected, actual);
+}
+
+/* Callers pick an API family with this for an id that is legitimately
+ * either one, so a mismatch is an expected answer rather than a violation
+ * to diagnose. */
+bool
+npt_context_object_is(struct npt_context *ctx, uint64_t id,
+                      npt_object_type want)
+{
+   if (!id)
+      return false;
+   mtx_lock(&ctx->object_mutex);
+   const struct hash_entry *entry =
+      _mesa_hash_table_search(ctx->object_table, &id);
+   const struct npt_object *obj = entry ? entry->data : NULL;
+   if (!obj && npt_ring_current())
+      obj = npt_context_await_object_locked(ctx, id);
+   const npt_object_type actual = obj ? obj->type : (npt_object_type)0;
+   const bool present = obj && obj->host_ptr;
+   mtx_unlock(&ctx->object_mutex);
+   return present && npt_object_type_is_compatible(actual, want);
+}
+
+void *npt_context_trace_hold_dc(struct npt_context *ctx, uint64_t id)
+{
+   void *dc = NULL;
+   mtx_lock(&ctx->object_mutex);
+   const struct hash_entry *entry = _mesa_hash_table_search(ctx->object_table, &id);
+   const struct npt_object *obj = entry ? entry->data : NULL;
+   if (obj && obj->host_ptr &&
+       (obj->type == NPT_OBJECT_TYPE_ID3D11DEVICECONTEXT ||
+        npt_object_type_has_ancestor(obj->type, NPT_OBJECT_TYPE_ID3D11DEVICECONTEXT))) {
+      dc = obj->host_ptr;
+      npt_com_add_ref(dc);
+   }
+   mtx_unlock(&ctx->object_mutex);
+   return dc;
+}
+
+uint64_t npt_context_trace_native_id(struct npt_context *ctx, void *object)
+{
+   void *unknown = NULL;
+   if (!object || NPT_FAILED(npt_com_query_interface(object, &NPT_IID_IUnknown, &unknown)) || !unknown)
+      return 0;
+   /* COM's actual IUnknown identity, never pointer arithmetic or a new
+    * registration. QI holds it through this existing-table-only lookup. */
+   mtx_lock(&ctx->object_mutex);
+   const struct npt_identity *ident = npt_identity_find_locked(ctx, unknown);
+   const uint64_t id = ident ? ident->primary_id : 0;
+   mtx_unlock(&ctx->object_mutex);
+   npt_com_release(unknown);
+   return id;
+}
+
+void *npt_context_trace_hold_texture(struct npt_context *ctx, uint64_t id,
+                                     uint64_t *primary)
+{
+   *primary = 0;
+   mtx_lock(&ctx->object_mutex);
+   const struct hash_entry *entry = _mesa_hash_table_search(ctx->object_table, &id);
+   const struct npt_object *obj = entry ? entry->data : NULL;
+   void *texture = NULL;
+   /* Never await an unknown id or downcast a generic IUnknown/Resource.
+    * AddRef is the same native ref operation used by canonical registration;
+    * no descriptor/GPU operation runs under the object-table mutex. */
+   if (obj && obj->host_ptr && (obj->type == NPT_OBJECT_TYPE_ID3D11TEXTURE2D ||
+       npt_object_type_has_ancestor(obj->type, NPT_OBJECT_TYPE_ID3D11TEXTURE2D))) {
+      texture = obj->host_ptr;
+      npt_com_add_ref(texture);
+      *primary = npt_identity_primary_locked(ctx, obj);
+   }
+   mtx_unlock(&ctx->object_mutex);
+   return texture;
+}
+
+
+/* On a non-permissive failure of a nonzero id, sets *miss and leaves
+ * the error policy to the caller: npt_context_lookup_object goes
+ * decoder-fatal, npt_cs_handle_lookup records a decoder-private miss
+ * the generated dispatch may absorb. */
+static void *
+npt_context_lookup_object_impl(struct npt_context *ctx,
+                               struct npt_cs_decoder *dec,
+                               uint64_t id,
+                               npt_object_type expected,
+                               bool *miss)
+{
+   if (!id)
+      return NULL;
+
+   /* Fast path: this decoder's private cache, valid while the slot's
+    * generation has not moved since the entry was filled (see npt_cs.h).
+    * The acquire load pairs with the release bump in unregister / type
+    * change, so a hit can never hand out an id that was removed before
+    * this call. */
+   struct npt_cs_lookup_entry *ce = NULL;
+   uint64_t gen = 0;
+   if (likely(dec)) {
+      const uint32_t slot = npt_lookup_cache_slot(id);
+      gen = atomic_load_explicit(&ctx->object_gen[slot],
+                                 memory_order_acquire);
+      ce = &dec->lookup_cache[slot];
+      if (likely(ce->id == id && ce->gen == gen &&
+                 npt_object_type_is_compatible((npt_object_type)ce->type,
+                                               expected))) {
+         if (npt_profile_enabled())
+            npt_profile_record_lookup(0, false, 0);
+         return ce->host_ptr;
+      }
+   }
+
+   /* IUNKNOWN lookups are permissive: COM_RELEASE doesn't deref by type
+    * and can legitimately race a Create that would register the id. */
+   const bool permissive = (expected == NPT_OBJECT_TYPE_IUNKNOWN);
+
+   const uint64_t prof_t0 =
+      npt_profile_enabled() ? npt_profile_now_ns() : 0;
+   mtx_lock(&ctx->object_mutex);
+   const struct hash_entry *entry =
+      _mesa_hash_table_search(ctx->object_table, &id);
+   const struct npt_object *obj = entry ? entry->data : NULL;
+   /* Rings decode in parallel, so a use can reach this ring before the
+    * ring carrying the Create has registered the id.  Wait for it here
+    * rather than have the guest serialise the two rings. */
+   if (!obj && !permissive && npt_ring_current())
+      obj = npt_context_await_object_locked(ctx, id);
+   const bool failed_create = obj && !obj->host_ptr;
+   if (failed_create)
+      obj = NULL;
+   const npt_object_type actual = obj ? obj->type : (npt_object_type)0;
+   void *host_ptr = obj ? obj->host_ptr : NULL;
+   mtx_unlock(&ctx->object_mutex);
+   if (obj && ce) {
+      /* Stamp the generation read before the table lookup: an unregister
+       * that raced it bumps past this value and the entry reads stale. */
+      ce->id = id;
+      ce->host_ptr = host_ptr;
+      ce->gen = gen;
+      ce->type = (uint32_t)actual;
+   }
+   if (npt_profile_enabled()) {
+      /* cmd_type=0: per-method attribution happens at the ring loop. */
+      npt_profile_record_lookup(npt_profile_now_ns() - prof_t0,
+                                !obj || !npt_object_type_is_compatible(
+                                          actual, expected),
+                                0);
+   }
+
+   if (likely(obj && npt_object_type_is_compatible(actual, expected)))
+      return host_ptr;
+
+   if (obj) {
+      npt_log("object table: id 0x%016" PRIx64 " type mismatch "
+              "(expected %u, registered %u)", id,
+              (unsigned)expected, (unsigned)actual);
+   } else if (failed_create) {
+      /* Reported once, at registration. */
+   } else if (!permissive) {
+      npt_log("object table: unregistered id 0x%016" PRIx64
+              " (expected type %u)", id, (unsigned)expected);
+   }
+
+   *miss = !permissive;
+   return NULL;
+}
+
+void *
+npt_context_lookup_object(struct npt_context *ctx,
+                          struct npt_cs_decoder *dec,
+                          uint64_t id,
+                          npt_object_type expected)
+{
+   bool miss = false;
+   void *obj = npt_context_lookup_object_impl(ctx, dec, id, expected, &miss);
+   if (miss && dec)
+      npt_cs_decoder_set_fatal(dec);
+   return obj;
+}
+
+void
+npt_context_release_object(struct npt_context *ctx, uint64_t guest_id)
+{
+   if (!guest_id || !ctx || !ctx->object_table)
+      return;
+
+   /* Permissive: stray RELEASE on an unregistered id (e.g. racing a
+    * host-failed QI) is silent; the guest-side wrapper dtor emits
+    * COM_RELEASE unconditionally. */
+   mtx_lock(&ctx->object_mutex);
+   struct hash_entry *entry =
+      _mesa_hash_table_search(ctx->object_table, &guest_id);
+   if (!entry) {
+      mtx_unlock(&ctx->object_mutex);
+      return;
+   }
+   struct npt_object *e = entry->data;
+   void *obj = e->host_ptr;
+   if (obj && e->regs > 1) {
+      /* A surplus registration: the id stays, with the state keyed by
+       * it (feedback, heap pins), and only its host-library ref goes. */
+      e->regs--;
+      mtx_unlock(&ctx->object_mutex);
+      npt_com_release(obj);
+      return;
+   }
+   /* The id leaves the table under the lock, so no canonical answer can
+    * name it again on its way out. */
+   npt_context_unregister_locked(ctx, entry);
+   mtx_unlock(&ctx->object_mutex);
+
+   /* Order: feedback_unregister BEFORE IUnknown::Release, otherwise a
+    * between-commands poll could call GetData / GetCompletedValue on
+    * a freed pointer. */
+   npt_feedback_unregister(ctx, guest_id);
+
+   if (!obj)
+      return;
+
+   npt_com_release(obj);
+
+   /* Only after the host library dropped the heap, and with it the
+    * import: releasing the pin can complete a deferred munmap. */
+   npt_heap12_on_release_object(ctx, guest_id);
+}
+
+HRESULT
+npt_context_query_interface(struct npt_context *ctx,
+                            uint64_t src_guest_id,
+                            const GUID *riid,
+                            uint64_t new_guest_id,
+                            struct npt_wire_object_ref *ref)
+{
+   memset(ref, 0, sizeof(*ref));
+   /* The source may have been created on another ring whose decoder
+    * has not reached the Create yet, so wait for it explicitly. */
+   void *src = NULL;
+   void *identity = NULL;
+   mtx_lock(&ctx->object_mutex);
+   struct hash_entry *entry =
+      _mesa_hash_table_search(ctx->object_table, &src_guest_id);
+   const struct npt_object *obj = entry ? entry->data : NULL;
+   if (!obj && src_guest_id && npt_ring_current())
+      obj = npt_context_await_object_locked(ctx, src_guest_id);
+   if (obj) {
+      src = obj->host_ptr;
+      identity = obj->identity;
+   }
+   mtx_unlock(&ctx->object_mutex);
+   if (!src || !new_guest_id)
+      return NPT_E_NOINTERFACE;
+
+   void *out = NULL;
+   HRESULT hr = npt_com_query_interface(src, riid, &out);
+   /* An interface QueryInterface hands out belongs to the object it was
+    * asked of, by COM's rule, so the result joins the source's identity
+    * whatever the backend's own IUnknown says (a backend whose DXGI view
+    * of a device answers IUnknown with another pointer would otherwise
+    * split the object in two).  Resolve the type via the IID table so
+    * later lookups validate exactly; unknown IIDs fall back to IUNKNOWN,
+    * which answers the object's primary. */
+   if (NPT_SUCCEEDED(hr) && out)
+      npt_context_register_canonical_as(ctx, new_guest_id, out, identity,
+                                        npt_object_type_from_iid(riid), ref);
+   return hr;
+}
+
+/* Out-of-line because npt_cs.h must not include npt_context.h
+ * (header cycle through the generated dispatch types). */
+void *
+npt_cs_handle_lookup(struct npt_dispatch_context *dispatch,
+                     npt_object_id id,
+                     npt_object_type type)
+{
+   if (!id)
+      return NULL;
+   struct npt_context *ctx = npt_context_from_dispatch(dispatch);
+   bool miss = false;
+   void *obj = npt_context_lookup_object_impl(ctx, dispatch->decoder, id,
+                                              type, &miss);
+   if (miss)
+      npt_cs_decoder_note_handle_miss(dispatch->decoder);
+   return obj;
+}
+
+void
+npt_cs_handle_register_guest_id(struct npt_dispatch_context *dispatch,
+                                uint64_t guest_id,
+                                void *obj,
+                                npt_object_type type)
+{
+   if (!guest_id || !obj)
+      return;
+   struct npt_context *ctx = npt_context_from_dispatch(dispatch);
+   npt_context_register_object(ctx, guest_id, obj, type);
+}
+
+void
+npt_cs_handle_register_canonical_guest_id(struct npt_dispatch_context *dispatch,
+                                          uint64_t guest_id,
+                                          void *obj,
+                                          npt_object_type type,
+                                          struct npt_wire_object_ref *ref)
+{
+   struct npt_context *ctx = npt_context_from_dispatch(dispatch);
+   npt_context_register_canonical_object(ctx, guest_id, obj, type, ref);
+}
+
+void
+npt_cs_handle_register_failed_guest_id(struct npt_dispatch_context *dispatch,
+                                       uint64_t guest_id)
+{
+   if (!guest_id)
+      return;
+   npt_context_register_failed_object(npt_context_from_dispatch(dispatch),
+                                      guest_id);
+}
+
+/* ---------------------------------------------------------------------- */
+/* Deferred COM_RELEASE                                                   */
+/* ---------------------------------------------------------------------- */
+
+struct npt_deferred_release {
+   struct list_head head;
+   uint64_t guest_id;
+   _Atomic uint32_t pending;
+   uint32_t count;
+   struct npt_ring_watch watch[];
+};
+
+void
+npt_context_deferred_release_settle(struct npt_context *ctx,
+                                    struct npt_deferred_release *d)
+{
+   if (atomic_fetch_sub_explicit(&d->pending, 1, memory_order_acq_rel) != 1)
+      return;
+
+   mtx_lock(&ctx->deferred_mutex);
+   list_del(&d->head);
+   mtx_unlock(&ctx->deferred_mutex);
+
+   npt_context_release_object(ctx, d->guest_id);
+   free(d);
+}
+
+void
+npt_context_release_object_ordered(struct npt_context *ctx,
+                                   uint64_t guest_id,
+                                   const struct npt_cmd_com_release_wait *wait,
+                                   uint32_t count)
+{
+   if (!guest_id)
+      return;
+
+   /* Each named ring that has not yet decoded past its position gets a
+    * watch; the ring thread that settles the last watch runs the
+    * release.  Rings are resolved under ring_mutex, which keeps them
+    * alive while the watch is placed; one that is gone was drained by
+    * its DESTROY_RING, and one the context path has not registered yet
+    * is waited for, since the guest can name a ring before the host has
+    * seen its CREATE_RING. */
+   mtx_lock(&ctx->ring_mutex);
+   struct npt_deferred_release *d =
+      count ? malloc(sizeof(*d) + count * sizeof(d->watch[0])) : NULL;
+   if (!d) {
+      mtx_unlock(&ctx->ring_mutex);
+      npt_context_release_object(ctx, guest_id);
+      return;
+   }
+   d->guest_id = guest_id;
+   d->count = 0;
+   /* Held by this registration pass, so a watch settled by a fast ring
+    * cannot run the release before every watch is placed. */
+   atomic_store_explicit(&d->pending, 1, memory_order_relaxed);
+   mtx_lock(&ctx->deferred_mutex);
+   list_addtail(&d->head, &ctx->deferred_releases);
+   mtx_unlock(&ctx->deferred_mutex);
+
+   for (uint32_t i = 0; i < count; i++) {
+      /* A ring the guest named but the context path has not registered
+       * yet is waited for (ring_mutex is dropped inside); one that was
+       * destroyed decoded everything it will ever decode. */
+      struct npt_ring *r = npt_ring_lookup_wait_locked(ctx, wait[i].ring_id);
+      if (!r || npt_seqno_ge(npt_ring_load_head(r), wait[i].seqno))
+         continue;
+      struct npt_ring_watch *w = &d->watch[d->count++];
+      w->release = d;
+      w->seqno = wait[i].seqno;
+      atomic_fetch_add_explicit(&d->pending, 1, memory_order_relaxed);
+      npt_ring_watch_add(r, w);
+   }
+   mtx_unlock(&ctx->ring_mutex);
+
+   npt_context_deferred_release_settle(ctx, d);
+}
+
+struct npt_context *
+npt_context_create(uint32_t ctx_id,
+                   npt_renderer_retire_fence_callback_type retire_fence,
+                   size_t debug_len,
+                   const char *debug_name)
+{
+   struct npt_context *ctx = calloc(1, sizeof(*ctx));
+   if (!ctx)
+      return NULL;
+
+   atomic_init(&ctx->caption_rect_seen, false);
+   ctx->ctx_id = ctx_id;
+   ctx->retire_fence = retire_fence;
+
+#ifdef ENABLE_RENDER_SERVER_WORKER_THREAD
+   ctx->on_worker_thread = true;
+#else
+   ctx->on_worker_thread = false;
+#endif
+
+   if (debug_name && debug_len) {
+      ctx->debug_name = malloc(debug_len + 1);
+      if (!ctx->debug_name)
+         goto err_debug_name;
+      memcpy(ctx->debug_name, debug_name, debug_len);
+      ctx->debug_name[debug_len] = '\0';
+   }
+
+   if (mtx_init(&ctx->ring_mutex, mtx_plain) != thrd_success)
+      goto err_ring_mutex;
+   if (cnd_init(&ctx->ring_cond) != thrd_success)
+      goto err_ring_cond;
+
+   list_inithead(&ctx->rings);
+
+   if (mtx_init(&ctx->wait_ring.mutex, mtx_plain) != thrd_success)
+      goto err_wait_ring_mutex;
+
+   if (cnd_init(&ctx->wait_ring.cond) != thrd_success)
+      goto err_wait_ring_cond;
+
+   if (mtx_init(&ctx->resource_mutex, mtx_plain) != thrd_success)
+      goto err_resource_mutex;
+
+   ctx->resource_table = _mesa_hash_table_create(NULL, hash_uint32, equal_uint32);
+   if (!ctx->resource_table)
+      goto err_resource_table;
+
+   if (mtx_init(&ctx->pending_blob_mutex, mtx_plain) != thrd_success)
+      goto err_pending_blob_mutex;
+
+   ctx->pending_blob_table =
+      _mesa_hash_table_create(NULL, hash_uint64, equal_uint64);
+   if (!ctx->pending_blob_table)
+      goto err_pending_blob_table;
+
+   if (mtx_init(&ctx->heap_import_mutex, mtx_plain) != thrd_success)
+      goto err_heap_import_mutex;
+
+   ctx->heap_import_table =
+      _mesa_hash_table_create(NULL, hash_uint64, equal_uint64);
+   if (!ctx->heap_import_table)
+      goto err_heap_import_table;
+
+   if (mtx_init(&ctx->sync_queues_mutex, mtx_plain) != thrd_success)
+      goto err_sync_queues_mutex;
+
+   if (!npt_event_init(ctx))
+      goto err_event;
+
+   if (mtx_init(&ctx->object_mutex, mtx_plain) != thrd_success)
+      goto err_object_mutex;
+   if (cnd_init(&ctx->object_cond) != thrd_success)
+      goto err_object_cond;
+   ctx->object_waiters = 0;
+   for (uint32_t i = 0; i < NPT_CS_LOOKUP_CACHE_SIZE; i++)
+      atomic_store_explicit(&ctx->object_gen[i], 0, memory_order_relaxed);
+
+   if (mtx_init(&ctx->deferred_mutex, mtx_plain) != thrd_success)
+      goto err_deferred_mutex;
+   list_inithead(&ctx->deferred_releases);
+
+   ctx->object_table =
+      _mesa_hash_table_create(NULL, hash_uint64, equal_uint64);
+   if (!ctx->object_table)
+      goto err_object_table;
+   ctx->identity_table = _mesa_pointer_hash_table_create(NULL);
+   if (!ctx->identity_table)
+      goto err_identity_table;
+
+   if (npt_cs_encoder_init(&ctx->encoder, &ctx->cs_fatal_error))
+      goto err_encoder;
+
+   if (npt_cs_decoder_init(&ctx->decoder, &ctx->cs_fatal_error))
+      goto err_decoder;
+
+   npt_feedback_init(ctx);
+
+   npt_context_init_dispatch(ctx);
+
+   list_inithead(&ctx->head);
+
+   npt_log("created Neptune context %u (%.*s)", ctx_id, (int)debug_len,
+           debug_name ? debug_name : "");
+
+   return ctx;
+
+err_decoder:
+   npt_cs_encoder_fini(&ctx->encoder);
+err_encoder:
+   _mesa_hash_table_destroy(ctx->identity_table, NULL);
+err_identity_table:
+   _mesa_hash_table_destroy(ctx->object_table, NULL);
+err_object_table:
+   mtx_destroy(&ctx->deferred_mutex);
+err_deferred_mutex:
+   cnd_destroy(&ctx->object_cond);
+err_object_cond:
+   mtx_destroy(&ctx->object_mutex);
+err_object_mutex:
+   npt_event_fini(ctx);
+err_event:
+   mtx_destroy(&ctx->sync_queues_mutex);
+err_sync_queues_mutex:
+   _mesa_hash_table_destroy(ctx->heap_import_table, NULL);
+err_heap_import_table:
+   mtx_destroy(&ctx->heap_import_mutex);
+err_heap_import_mutex:
+   _mesa_hash_table_destroy(ctx->pending_blob_table, NULL);
+err_pending_blob_table:
+   mtx_destroy(&ctx->pending_blob_mutex);
+err_pending_blob_mutex:
+   _mesa_hash_table_destroy(ctx->resource_table, NULL);
+err_resource_table:
+   mtx_destroy(&ctx->resource_mutex);
+err_resource_mutex:
+   cnd_destroy(&ctx->wait_ring.cond);
+err_wait_ring_cond:
+   mtx_destroy(&ctx->wait_ring.mutex);
+err_wait_ring_mutex:
+   cnd_destroy(&ctx->ring_cond);
+err_ring_cond:
+   mtx_destroy(&ctx->ring_mutex);
+err_ring_mutex:
+   free(ctx->debug_name);
+err_debug_name:
+   free(ctx);
+   return NULL;
+}
+
+void
+npt_context_destroy(struct npt_context *ctx)
+{
+   npt_log("destroying Neptune context %u", ctx->ctx_id);
+
+   /* Stop the ring monitor before the rings so it can't touch a ring
+    * mid-teardown. */
+   npt_context_ring_monitor_fini(ctx);
+
+   /* Context destruction is single-threaded; no ring_mutex needed. */
+   list_for_each_entry_safe (struct npt_ring, ring, &ctx->rings, head) {
+      npt_ring_stop(ring);
+      npt_ring_destroy(ring);
+   }
+
+   /* Ring threads are joined before typed tails/objects are released.
+    * UNKNOWN quarantines the context; never force-retire GPU success. */
+   if (!npt_job_context_fini(ctx)) return;
+
+   for (uint32_t i = 0; i < ARRAY_SIZE(ctx->sync_queues); i++) {
+      if (ctx->sync_queues[i]) {
+         npt_queue_destroy(ctx->sync_queues[i]);
+         ctx->sync_queues[i] = NULL;
+      }
+   }
+   mtx_destroy(&ctx->sync_queues_mutex);
+
+   /* Retire fences still parked awaiting their ARM before the event
+    * state (and its lists) go away, so guest waiters unblock. */
+   npt_event_drain_parked_fences(ctx);
+   npt_event_fini(ctx);
+
+   /* Every ring was destroyed above, which settled every watch and ran
+    * every deferred release. */
+   assert(list_is_empty(&ctx->deferred_releases));
+   cnd_destroy(&ctx->ring_cond);
+   free(ctx->destroyed_ring_ids);
+   mtx_destroy(&ctx->deferred_mutex);
+
+   /* Guests are expected to release every COM object before context
+    * teardown.  Free any straggler entries to plug a guest leak. */
+   hash_table_foreach(ctx->object_table, entry) {
+      free(entry->data);
+   }
+   _mesa_hash_table_destroy(ctx->object_table, NULL);
+   hash_table_foreach(ctx->identity_table, entry) {
+      struct npt_identity *ident = entry->data;
+      free(ident->ids);
+      free(ident);
+   }
+   _mesa_hash_table_destroy(ctx->identity_table, NULL);
+   cnd_destroy(&ctx->object_cond);
+   mtx_destroy(&ctx->object_mutex);
+
+   npt_feedback_fini(ctx);
+
+   npt_cs_decoder_fini(&ctx->decoder);
+   npt_cs_encoder_fini(&ctx->encoder);
+
+   /* Before the resource table goes away, so a zombie held up only by
+    * the import table is not freed twice. */
+   npt_heap12_context_fini(ctx);
+   _mesa_hash_table_destroy(ctx->heap_import_table, NULL);
+   mtx_destroy(&ctx->heap_import_mutex);
+
+   _mesa_hash_table_destroy(ctx->resource_table, npt_context_free_resource);
+   mtx_destroy(&ctx->resource_mutex);
+
+   if (ctx->sync_maps.count)
+      npt_log("context destroyed with %u sync map(s) still active",
+              ctx->sync_maps.count);
+   free(ctx->sync_maps.entries);
+
+   hash_table_foreach(ctx->pending_blob_table, entry) {
+      struct npt_pending_blob *pb = entry->data;
+      if (pb->fd >= 0)
+         close(pb->fd);
+      free(pb);
+   }
+   _mesa_hash_table_destroy(ctx->pending_blob_table, NULL);
+   mtx_destroy(&ctx->pending_blob_mutex);
+
+   cnd_destroy(&ctx->wait_ring.cond);
+   mtx_destroy(&ctx->wait_ring.mutex);
+
+   mtx_destroy(&ctx->ring_mutex);
+
+   free(ctx->debug_name);
+   free(ctx);
+}
+
+void
+npt_context_on_ring_seqno_update(struct npt_context *ctx,
+                                 uint64_t ring_id,
+                                 uint32_t ring_seqno)
+{
+   /* Steady-state fast path skips the per-command mutex.  Writers
+    * publish .id under the mutex with release semantics; an acquire
+    * load returning 0 or a different ring_id means there is nothing
+    * to signal.  The wait path re-checks the ring head after setting
+    * .id, so a wakeup racing with a setter falls through to the
+    * producer's next call. */
+   if (likely(atomic_load_explicit(&ctx->wait_ring.id,
+                                   memory_order_acquire) != ring_id))
+      return;
+
+   mtx_lock(&ctx->wait_ring.mutex);
+   if (ctx->wait_ring.id == ring_id &&
+       npt_seqno_ge(ring_seqno, ctx->wait_ring.seqno))
+      cnd_signal(&ctx->wait_ring.cond);
+   mtx_unlock(&ctx->wait_ring.mutex);
+}
+
+bool
+npt_context_get_wait_ring_seqno(struct npt_context *ctx,
+                                uint64_t ring_id,
+                                uint32_t *out_seqno)
+{
+   /* Same lockless check as on_ring_seqno_update: .id is published
+    * under the mutex with release semantics, so an acquire load that
+    * names another ring, or none, needs no lock.  Only a ring that is
+    * being waited on takes the mutex to read the seqno. */
+   if (likely(atomic_load_explicit(&ctx->wait_ring.id,
+                                   memory_order_acquire) != ring_id))
+      return false;
+
+   bool wait_ring = false;
+   mtx_lock(&ctx->wait_ring.mutex);
+   if (ctx->wait_ring.id == ring_id) {
+      wait_ring = true;
+      *out_seqno = ctx->wait_ring.seqno;
+   }
+   mtx_unlock(&ctx->wait_ring.mutex);
+   return wait_ring;
+}
+
+static void
+npt_context_wake_rings(struct npt_context *ctx,
+                       void (*wake)(struct npt_ring *ring))
+{
+   mtx_lock(&ctx->ring_mutex);
+   list_for_each_entry(struct npt_ring, r, &ctx->rings, head) {
+      wake(r);
+   }
+   mtx_unlock(&ctx->ring_mutex);
+}
+
+/* A feedback entry can be armed from a thread other than the ring
+ * thread that will poll it, and a ring thread with an empty pending list
+ * parks in an unbounded wait.  Without this the entry would sit unpolled
+ * and the guest would wait forever on a value that is never published. */
+void
+npt_context_notify_rings_feedback(struct npt_context *ctx)
+{
+   if (!ctx)
+      return;
+
+   npt_context_wake_rings(ctx, npt_ring_notify_feedback);
+}
+
+void
+npt_context_on_ring_fatal(struct npt_context *ctx)
+{
+   ctx->cs_fatal_error = true;
+
+   mtx_lock(&ctx->wait_ring.mutex);
+   cnd_signal(&ctx->wait_ring.cond);
+   mtx_unlock(&ctx->wait_ring.mutex);
+
+   /* Wake any ring thread parked in WAIT_VIRTQUEUE_SEQNO or idle so
+    * it observes the fatal flag (both waits share ring->mutex/cond). */
+   npt_context_wake_rings(ctx, npt_ring_wake);
+}
+
+/* Ring monitor (ALIVE-bit reporter) */
+
+static struct timespec
+npt_context_timespec_add(struct timespec a, struct timespec b)
+{
+   const long NS_PER_SEC = 1000000000;
+   a.tv_sec += b.tv_sec;
+   a.tv_nsec += b.tv_nsec;
+   if (a.tv_nsec >= NS_PER_SEC) {
+      a.tv_sec += 1;
+      a.tv_nsec -= NS_PER_SEC;
+   }
+   return a;
+}
+
+static int
+npt_context_ring_monitor_thread(void *arg)
+{
+   struct npt_context *ctx = arg;
+
+   char thread_name[16];
+   snprintf(thread_name, ARRAY_SIZE(thread_name), "npt-mon-%u", ctx->ctx_id);
+   u_thread_setname(thread_name);
+
+   int ret = thrd_busy;
+   while (ctx->ring_monitor.started) {
+      /* Fire ALIVE on first iteration AND on every period timeout.
+       * Treating thrd_timeout as an error would silently wedge the
+       * guest watchdog on the first period; only real errors break. */
+      if (ret == thrd_busy || ret == thrd_timeout) {
+         mtx_lock(&ctx->ring_mutex);
+         list_for_each_entry (struct npt_ring, ring, &ctx->rings, head) {
+            if (ring->monitor)
+               npt_ring_heartbeat(ring);
+         }
+         mtx_unlock(&ctx->ring_mutex);
+         ret = 0;
+      } else if (ret) {
+         break;
+      }
+      /* ret == 0: thrd_success (explicit signal from monitor_fini or
+       * period-tightening); re-check started flag at top of loop. */
+
+      mtx_lock(&ctx->ring_monitor.mutex);
+      struct timespec ts;
+      if ((ret = clock_gettime(CLOCK_REALTIME, &ts))) {
+         mtx_unlock(&ctx->ring_monitor.mutex);
+         break;
+      }
+
+      const uint32_t period_us = ctx->ring_monitor.report_period_us;
+      ts = npt_context_timespec_add(
+         ts, (struct timespec){ period_us / 1000000,
+                                (period_us % 1000000) * 1000 });
+      ret = cnd_timedwait(&ctx->ring_monitor.cond, &ctx->ring_monitor.mutex,
+                          &ts);
+      mtx_unlock(&ctx->ring_monitor.mutex);
+   }
+
+   return ret;
+}
+
+bool
+npt_context_ring_monitor_init(struct npt_context *ctx,
+                              uint32_t report_period_us)
+{
+   assert(report_period_us > 0);
+
+   /* Already started: tighten the period if shorter, kick the thread
+    * so it observes the new period. */
+   if (ctx->ring_monitor.started) {
+      mtx_lock(&ctx->ring_monitor.mutex);
+      if (report_period_us < ctx->ring_monitor.report_period_us) {
+         ctx->ring_monitor.report_period_us = report_period_us;
+         cnd_signal(&ctx->ring_monitor.cond);
+      }
+      mtx_unlock(&ctx->ring_monitor.mutex);
+      return true;
+   }
+
+   if (mtx_init(&ctx->ring_monitor.mutex, mtx_plain) != thrd_success)
+      goto err_mtx;
+   if (cnd_init(&ctx->ring_monitor.cond) != thrd_success)
+      goto err_cnd;
+
+   ctx->ring_monitor.report_period_us = report_period_us;
+   ctx->ring_monitor.started = true;
+
+   if (thrd_create(&ctx->ring_monitor.thread, npt_context_ring_monitor_thread,
+                   ctx) != thrd_success)
+      goto err_thrd;
+
+   return true;
+
+err_thrd:
+   ctx->ring_monitor.started = false;
+   cnd_destroy(&ctx->ring_monitor.cond);
+err_cnd:
+   mtx_destroy(&ctx->ring_monitor.mutex);
+err_mtx:
+   return false;
+}
+
+static void
+npt_context_ring_monitor_fini(struct npt_context *ctx)
+{
+   if (!ctx->ring_monitor.started)
+      return;
+
+   mtx_lock(&ctx->ring_monitor.mutex);
+   ctx->ring_monitor.started = false;
+   cnd_signal(&ctx->ring_monitor.cond);
+   mtx_unlock(&ctx->ring_monitor.mutex);
+
+   thrd_join(ctx->ring_monitor.thread, NULL);
+
+   cnd_destroy(&ctx->ring_monitor.cond);
+   mtx_destroy(&ctx->ring_monitor.mutex);
+}
+
+bool
+npt_context_wait_ring_seqno(struct npt_context *ctx,
+                            struct npt_ring *ring,
+                            uint32_t ring_seqno)
+{
+   bool ok = true;
+
+   mtx_lock(&ctx->wait_ring.mutex);
+   /* Release-store so the producer's lockless acquire-load in
+    * on_ring_seqno_update sees this assignment before any subsequent
+    * cmd-publish + on_ring_seqno_update races to wake us. */
+   atomic_store_explicit(&ctx->wait_ring.id, ring->id,
+                         memory_order_release);
+   ctx->wait_ring.seqno = ring_seqno;
+   while (!ctx->cs_fatal_error && ok &&
+          !npt_seqno_ge(npt_ring_load_head(ring), ring_seqno)) {
+      ok = cnd_wait(&ctx->wait_ring.cond, &ctx->wait_ring.mutex) ==
+           thrd_success;
+   }
+   atomic_store_explicit(&ctx->wait_ring.id, (uint64_t)0,
+                         memory_order_release);
+   mtx_unlock(&ctx->wait_ring.mutex);
+
+   return ok;
+}
+
+/* cmd_type groups: 0 = transport (consumer-defined), 1-3 = top-level,
+ * 255 = COM.  Transport commands must be intercepted here; the
+ * protocol's default dispatcher sets fatal on them. */
+bool
+npt_context_dispatch_one_command(struct npt_context *ctx,
+                                 struct npt_dispatch_context *dispatch,
+                                 struct npt_cs_decoder *dec,
+                                 struct npt_cs_encoder *enc)
+{
+   struct npt_command_header peek;
+   npt_cs_decoder_peek(dec, sizeof(peek), &peek, sizeof(peek));
+   if (npt_cs_decoder_get_fatal(dec))
+      return false;
+
+   npt_caption_trace_copy(ctx, &peek, dec->cur, (size_t)(dec->end - dec->cur));
+   npt_caption_trace_draw(ctx, &peek, (size_t)(dec->end - dec->cur));
+   if (!npt_job_note_dispatch(ctx, dec, &peek)) {
+      npt_cs_decoder_set_fatal(dec); return false;
+   }
+   const uint32_t group = (peek.cmd_type >> 24) & 0xFFu;
+   /* Frame by the header cmd_size: a guest encoder that writes trailing
+    * bytes this decoder does not know about must not desynchronise the
+    * stream (DroidVM: Triton UMD vs host protocol skew). */
+   const uint8_t *cmd_start = (const uint8_t *)dec->cur;
+   const uint32_t cmd_size = peek.cmd_size;
+
+   if (group == 0) {
+      npt_cs_decoder_read(dec, sizeof(peek), &peek, sizeof(peek));
+      if (!npt_transport_dispatch(ctx, dispatch, dec, enc, &peek)) {
+         npt_log("unhandled transport command: cmd_type=0x%08x",
+                 peek.cmd_type);
+         npt_cs_decoder_set_fatal(dec);
+         return false;
+      }
+      /* A matched transport handler may still set fatal; the common
+       * tail check catches that. */
+   } else {
+      /* Generated dispatcher reads its own header. */
+      npt_dispatch_command(dispatch);
+      /* Event handles the decode substituted stay pinned for the
+       * duration of the call they were passed to. */
+      npt_event_unpin_dispatched(ctx);
+   }
+
+   if (group != 0 && !npt_cs_decoder_get_fatal(dec) && cmd_size >= sizeof(peek)) {
+      const uint8_t *cmd_end = cmd_start + cmd_size;
+      const uint8_t *cur = (const uint8_t *)dec->cur;
+      if (cur < cmd_end && cmd_end <= (const uint8_t *)dec->end) {
+         /* Log the first occurrence per cmd_type only (bounded table). */
+         static uint32_t seen[128];
+         static atomic_uint nseen;
+         unsigned n = atomic_load_explicit(&nseen, memory_order_relaxed);
+         bool first = true;
+         for (unsigned i = 0; i < n && i < ARRAY_SIZE(seen); i++)
+            if (seen[i] == peek.cmd_type) { first = false; break; }
+         if (first && n < ARRAY_SIZE(seen)) {
+            seen[n] = peek.cmd_type;
+            atomic_store_explicit(&nseen, n + 1, memory_order_release);
+            npt_log("dispatch: cmd_type=0x%08x decoded %zu of %u bytes; skipping %zu trailing (first for this cmd_type)",
+                    peek.cmd_type, (size_t)(cur - cmd_start), cmd_size,
+                    (size_t)(cmd_end - cur));
+         }
+         dec->cur = (void *)cmd_end;
+      }
+   }
+
+   return !npt_cs_decoder_get_fatal(dec);
+}
+
+bool
+npt_context_submit_cmd(struct npt_context *ctx, const void *buffer, size_t size)
+{
+   if (ctx->cs_fatal_error)
+      return false;
+
+   if (!npt_job_submit_begin(ctx)) return false;
+   struct npt_cs_decoder *dec = &ctx->decoder;
+   npt_cs_decoder_set_buffer_stream(dec, buffer, size);
+
+   while (npt_cs_decoder_has_command(dec)) {
+      if (!npt_context_dispatch_one_command(ctx, &ctx->dispatch, dec,
+                                            &ctx->encoder)) {
+         npt_log("context %u: dispatch failed", ctx->ctx_id);
+         npt_job_submit_end(ctx, false);
+         npt_cs_decoder_reset(dec);
+         return false;
+      }
+   }
+
+   npt_cs_decoder_reset(dec);
+   npt_job_submit_end(ctx, true);
+   return true;
+}
+
+bool
+npt_context_submit_fence(struct npt_context *ctx,
+                         uint32_t flags, uint32_t ring_idx,
+                         uint64_t fence_id)
+{
+   if (flags & NPT_GPU_JOB_COMPLETE) {
+      if (!npt_job_active(ctx) || ring_idx != 0) return false;
+   }
+   if (npt_job_active(ctx) && ring_idx == 0)
+      return npt_job_fence(ctx, flags, fence_id);
+
+   /* ring_idx 0 = CPU timeline, retire immediately. */
+   if (ring_idx == 0) {
+      ctx->retire_fence(ctx->ctx_id, ring_idx, fence_id);
+      return true;
+   }
+
+   if (ring_idx >= ARRAY_SIZE(ctx->sync_queues)) {
+      npt_log("submit_fence: invalid ring_idx %u", ring_idx);
+      return false;
+   }
+
+   /* Non-event rings (below NPT_EVENT_RING_BASE) carry no wait source;
+    * retire on the CPU timeline. */
+   if (ring_idx < NPT_EVENT_RING_BASE) {
+      ctx->retire_fence(ctx->ctx_id, ring_idx, fence_id);
+      return true;
+   }
+
+   /* Event rings: the wait source comes from a pending ARM_EVENT_FENCE.
+    * Fence and ARM travel on independent channels, so either may arrive
+    * first; pop the ARM or park the fence atomically.  Retiring on a
+    * miss is not an option -- it completes the guest's fence wait before
+    * the GPU work has run. */
+   struct npt_event_paired paired;
+   int sync_fd = npt_event_pop_arm_or_park_fence(ctx, ring_idx, fence_id,
+                                                 &paired);
+   if (sync_fd == NPT_EVENT_FENCE_PARKED)
+      return true;
+   if (sync_fd < 0) {
+      /* Allocation failure: retiring early is still wrong, but wedging
+       * the guest is worse.  Loud. */
+      npt_log("submit_fence: PARK FAILED (ring=%u id=%" PRIu64 ") -- "
+              "retiring EARLY", ring_idx, fence_id);
+      ctx->retire_fence(ctx->ctx_id, ring_idx, fence_id);
+      return true;
+   }
+
+   return npt_context_pair_event_fence(ctx, ring_idx, fence_id, &paired);
+}
+
+bool
+npt_context_pair_event_fence(struct npt_context *ctx,
+                             uint32_t ring_idx, uint64_t fence_id,
+                             const struct npt_event_paired *paired)
+{
+   int sync_fd = paired->fd;
+   /* No vkGetDeviceQueue2 equivalent: create the sync queue on
+    * first use for a given ring_idx. */
+   mtx_lock(&ctx->sync_queues_mutex);
+   struct npt_queue *queue = ctx->sync_queues[ring_idx];
+   if (!queue) {
+      queue = npt_queue_create(ctx, ring_idx);
+      if (!queue) {
+         mtx_unlock(&ctx->sync_queues_mutex);
+         npt_log("pair_event_fence: failed to create sync queue for "
+                 "ring_idx %u", ring_idx);
+         close(sync_fd);
+         npt_event_release_proxy(ctx, paired->release_proxy);
+         if (paired->check_fence)
+            npt_d3d12_gate_release(paired->check_fence);
+         ctx->retire_fence(ctx->ctx_id, ring_idx, fence_id);
+         return true;
+      }
+      ctx->sync_queues[ring_idx] = queue;
+   }
+   mtx_unlock(&ctx->sync_queues_mutex);
+
+   if (!npt_queue_sync_submit(queue, ring_idx, fence_id, paired)) {
+      /* The submit released the paired wait source, so nothing is left
+       * that could ever retire this fence.  Retiring early is wrong;
+       * leaving the guest's wait outstanding for good is worse. */
+      npt_log("pair_event_fence: sync submit failed (ring=%u id=%" PRIu64
+              ") -- retiring EARLY", ring_idx, fence_id);
+      ctx->retire_fence(ctx->ctx_id, ring_idx, fence_id);
+      return false;
+   }
+
+   return true;
+}
+
+bool
+npt_context_create_resource(struct npt_context *ctx,
+                            uint32_t res_id,
+                            uint64_t blob_id,
+                            uint64_t blob_size,
+                            UNUSED uint32_t blob_flags,
+                            int shm_fd,
+                            uint64_t shm_fd_offset,
+                            struct virgl_context_blob *out_blob)
+{
+   if (blob_id == 0) {
+      /* SHM resource (ring buffer or generic shared memory). */
+      int fd = -1;
+      bool dmabuf_backed = false;
+      uint64_t fd_offset = 0;
+      if (shm_fd >= 0) {
+         /* The VMM process carved this blob out of the boot-shared
+          * venus_host pool, so it already knows the host VA and the
+          * guest needs no runtime registration.  Map that window
+          * instead of creating a private memfd. */
+         fd = fcntl(shm_fd, F_DUPFD_CLOEXEC, 0);
+         if (fd < 0)
+            return false;
+         fd_offset = shm_fd_offset;
+         npt_log("create_resource: res %u (%" PRIu64 " bytes) in the "
+                 "venus_host pool (fd off 0x%" PRIx64 ")", res_id,
+                 blob_size, fd_offset);
+      } else if (blob_size > NPT_HOSTMEM_DMABUF_MIN_SIZE) {
+         fd = npt_hostmem_alloc_dmabuf(blob_size);
+         dmabuf_backed = fd >= 0;
+      }
+      if (dmabuf_backed)
+         npt_log("create_resource: res %u (%" PRIu64 " bytes) backed by "
+                 "a GPU dmabuf", res_id, blob_size);
+      if (fd < 0)
+         fd = os_create_anonymous_file(blob_size, "npt-shmem");
+      if (fd < 0)
+         return false;
+
+      void *data = mmap(NULL, blob_size, PROT_WRITE | PROT_READ, MAP_SHARED, fd,
+                        fd_offset);
+      if (data == MAP_FAILED) {
+         npt_log("create_resource: mmap of res %u failed (errno %d)", res_id,
+                 errno);
+         close(fd);
+         return false;
+      }
+
+      struct npt_resource *res = calloc(1, sizeof(*res));
+      if (!res) {
+         munmap(data, blob_size);
+         close(fd);
+         return false;
+      }
+
+      res->res_id = res_id;
+      res->fd_type = VIRGL_RESOURCE_FD_SHM;
+      res->size = blob_size;
+      res->u.data = data;
+      res->fd_offset = fd_offset;
+      res->dmabuf_backed = dmabuf_backed;
+
+#ifdef __linux__
+      /* Seal against shrink so the memfd can back a udmabuf for a D3D12
+       * heap import.  Failure is not fatal: UDMABUF_CREATE then fails
+       * cleanly and the guest degrades to the sync-map path. */
+      if (!dmabuf_backed && fcntl(fd, F_ADD_SEALS, F_SEAL_SHRINK) < 0)
+         npt_log("create_resource: F_ADD_SEALS(F_SEAL_SHRINK) on res %u "
+                 "failed (errno %d); heap imports will fall back",
+                 res_id, errno);
+#endif
+
+      /* Ownership of the original fd leaves via out_blob, so keep a dup
+       * for a later heap import to wrap. */
+      res->u.fd = dup(fd);
+      if (res->u.fd < 0)
+         npt_log("create_resource: dup(fd) for res %u failed (errno %d); "
+                 "heap imports will fall back", res_id, errno);
+
+      mtx_lock(&ctx->resource_mutex);
+      if (_mesa_hash_table_search(ctx->resource_table, &res->res_id)) {
+         mtx_unlock(&ctx->resource_mutex);
+         npt_log("create_resource: duplicate res_id %u", res_id);
+         munmap(data, blob_size);
+         if (res->u.fd >= 0)
+            close(res->u.fd);
+         close(fd);
+         free(res);
+         return false;
+      }
+      _mesa_hash_table_insert(ctx->resource_table, &res->res_id, res);
+      mtx_unlock(&ctx->resource_mutex);
+
+      /* CACHED, not WC: the host maps these pages write-back, so a WC
+       * guest mapping of the same physical pages would alias two
+       * incoherent cacheability attributes.  Persistently-mapped heaps
+       * also hand these pages straight to the app, where write-back is
+       * mandatory for read performance. */
+      *out_blob = (struct virgl_context_blob){
+         .type = dmabuf_backed ? VIRGL_RESOURCE_FD_DMABUF : VIRGL_RESOURCE_FD_SHM,
+         .u.fd = fd,
+         .map_info = VIRGL_RENDERER_MAP_CACHE_CACHED,
+      };
+
+      return true;
+   } else {
+      /* Server-created blob (a shared texture's dmabuf export) staged
+       * earlier by EXPORT_BLOB. */
+      mtx_lock(&ctx->pending_blob_mutex);
+      struct hash_entry *entry =
+         _mesa_hash_table_search(ctx->pending_blob_table, &blob_id);
+      struct npt_pending_blob *pb = entry ? entry->data : NULL;
+      if (pb)
+         _mesa_hash_table_remove(ctx->pending_blob_table, entry);
+      mtx_unlock(&ctx->pending_blob_mutex);
+
+      if (!pb)
+         return false;
+
+      /* Record the binding in the resource table too, so a same-
+       * context SHARED_OPEN_RES on this res_id resolves without an
+       * attach round-trip (attach is deduped for the creating
+       * context).  The table owns its own dup. */
+      if (pb->fd_type == NPT_SHARED_FD_TYPE) {
+         int table_fd = dup(pb->fd);
+         if (table_fd >= 0 &&
+             !npt_context_import_resource(ctx, res_id, pb->fd_type,
+                                          table_fd, pb->size))
+            close(table_fd);
+      }
+
+      *out_blob = (struct virgl_context_blob){
+         .type = pb->fd_type,
+         .u.fd = pb->fd,
+         .map_info = 0,
+         .export_format = pb->virgl_format,
+      };
+      const unsigned caption_sample = npt_caption_trace_alias_sample();
+      if (caption_sample)
+         npt_log("CAPTION_REGISTER sample=%u cap=128 ctx=%u res=%u blob=%" PRIu64 " bytes=%zu phase=create-blob fd-identity-not-inferred",
+                 caption_sample, ctx->ctx_id, res_id, blob_id, (size_t)pb->size);
+      free(pb);
+
+      return true;
+   }
+}
+
+bool
+npt_context_register_pending_blob(struct npt_context *ctx,
+                                  uint64_t blob_id,
+                                  enum virgl_resource_fd_type fd_type,
+                                  int fd,
+                                  uint64_t size,
+                                  uint32_t virgl_format)
+{
+   struct npt_pending_blob *pb = calloc(1, sizeof(*pb));
+   if (!pb)
+      return false;
+
+   pb->blob_id = blob_id;
+   pb->fd_type = fd_type;
+   pb->fd = fd;
+   pb->size = size;
+   pb->virgl_format = virgl_format;
+
+   mtx_lock(&ctx->pending_blob_mutex);
+   _mesa_hash_table_insert(ctx->pending_blob_table, &pb->blob_id, pb);
+   mtx_unlock(&ctx->pending_blob_mutex);
+
+   return true;
+}
+
+bool
+npt_context_import_resource(struct npt_context *ctx, uint32_t res_id,
+                            enum virgl_resource_fd_type fd_type, int fd, uint64_t size)
+{
+   return npt_context_import_resource_layout_v1(ctx, res_id, fd_type, fd, size, NULL);
+}
+
+bool
+npt_context_import_resource_layout_v1(struct npt_context *ctx, uint32_t res_id,
+                                     enum virgl_resource_fd_type fd_type,
+                                     int fd, uint64_t size,
+                                     const struct virgl_import_layout_v1 *layout)
+{
+   if (layout && (!virgl_import_layout_valid(layout) ||
+                  layout->allocation_size != size || fd_type != VIRGL_RESOURCE_FD_DMABUF))
+      return false;
+   struct npt_resource *res = calloc(1, sizeof(*res));
+   if (!res)
+      return false;
+
+   res->res_id = res_id;
+   res->fd_type = fd_type;
+   res->size = size;
+   if (layout) res->import_layout = *layout;
+
+   /* Defer fd ownership until the hash-table insert succeeds: on
+    * duplicate-id rejection the caller still owns the original fd. */
+   switch (fd_type) {
+   case VIRGL_RESOURCE_FD_SHM:
+      res->u.data = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+      if (res->u.data == MAP_FAILED) {
+         free(res);
+         return false;
+      }
+      break;
+   case VIRGL_RESOURCE_FD_DMABUF:
+   case VIRGL_RESOURCE_FD_OPAQUE:
+      break;
+   default:
+      free(res);
+      return false;
+   }
+
+   mtx_lock(&ctx->resource_mutex);
+   if (_mesa_hash_table_search(ctx->resource_table, &res->res_id)) {
+      mtx_unlock(&ctx->resource_mutex);
+      npt_log("import_resource: duplicate res_id %u", res_id);
+      if (fd_type == VIRGL_RESOURCE_FD_SHM && res->u.data && res->u.data != MAP_FAILED)
+         munmap(res->u.data, size);
+      free(res);
+      return false;
+   }
+
+   /* Take fd ownership.  For shm the mapping serves the data windows,
+    * but the fd is kept as well: on hosts where shared textures ride
+    * shm, SHARED_OPEN_RES re-exports it to the D3D library. */
+   res->u.fd = fd;
+   _mesa_hash_table_insert(ctx->resource_table, &res->res_id, res);
+   mtx_unlock(&ctx->resource_mutex);
+
+   return true;
+}
+
+void
+npt_context_destroy_resource(struct npt_context *ctx, uint32_t res_id)
+{
+   /* Detach the hash entry first; the local `res` pointer survives as
+    * the stream-identity cookie for the ring scan below. */
+   mtx_lock(&ctx->resource_mutex);
+   struct hash_entry *entry =
+      _mesa_hash_table_search(ctx->resource_table, &res_id);
+   struct npt_resource *res = entry ? entry->data : NULL;
+   if (entry)
+      _mesa_hash_table_remove(ctx->resource_table, entry);
+   mtx_unlock(&ctx->resource_mutex);
+
+   if (!res)
+      return;
+
+   /* Mark fatal if the resource is the active stream of the encoder
+    * or any ring. */
+   if (!npt_cs_encoder_check_stream(&ctx->encoder, res))
+      ctx->cs_fatal_error = true;
+
+   /* Detach doomed rings under ring_mutex, then stop+destroy after
+    * dropping it: npt_ring_stop joins the ring thread, which can
+    * re-enter via on_ring_seqno_update — holding ring_mutex across
+    * the join would deadlock. */
+   struct list_head doomed;
+   list_inithead(&doomed);
+
+   mtx_lock(&ctx->ring_mutex);
+   list_for_each_entry_safe (struct npt_ring, ring, &ctx->rings, head) {
+      if (ring->resource == res ||
+          !npt_cs_decoder_check_stream(&ring->decoder, res) ||
+          !npt_cs_encoder_check_stream(&ring->encoder, res)) {
+         ctx->cs_fatal_error = true;
+         list_del(&ring->head);
+         list_addtail(&ring->head, &doomed);
+      }
+   }
+   mtx_unlock(&ctx->ring_mutex);
+
+   list_for_each_entry_safe (struct npt_ring, ring, &doomed, head) {
+      npt_ring_stop(ring);
+      npt_ring_destroy(ring);
+   }
+
+   /* A D3D12 heap import, or a MAP/UNMAP copy on a ring thread, still
+    * uses this mapping, so munmapping it now is a use-after-free.  Park
+    * the detached entry as a zombie for the last unpin to free. */
+   mtx_lock(&ctx->resource_mutex);
+   const uint32_t pins = res->pin_count;
+   if (pins > 0)
+      res->zombie = true;
+   mtx_unlock(&ctx->resource_mutex);
+
+   if (pins > 0) {
+      npt_log("destroy_resource: res %u still pinned %u time(s); "
+              "DEFERRING munmap until the last unpin (zombie)",
+              res_id, pins);
+      return;
+   }
+
+   npt_resource_free(res);
+}

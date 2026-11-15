@@ -1,0 +1,7 @@
+compat/directx-native/*.h: verbatim copy of directx-native's dxn_shared.h / dxn_version.h
+(github.com/osy/directx-native, include/directx-native/), the shared-resource contract that
+osy/dxvk takes since 2026-10-14 ("[native] take the shared-resource contract from
+directx-native").  src/neptune/npt_shared.c was written against the older
+dxvk_shared_resource.h (struct DxvkSharedTextureDescriptor); with -DNPT_DXN_SHARED=1 (set in
+Android.bp) it uses dxn_shared_texture instead.  Keep this copy in lockstep with the dxvk that
+provides libd3d11.so/libdxgi.so (dxn_abi_version() must match: DXN_ABI_VERSION).

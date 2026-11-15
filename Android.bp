@@ -1,0 +1,381 @@
+//
+// Copyright (C) 2018 The Android Open Source Project
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+
+package {
+    default_applicable_licenses: ["external_virglrenderer_license"],
+}
+
+// Added automatically by a large-scale-change that took the approach of
+// 'apply every license found to every target'. While this makes sure we respect
+// every license restriction, it may not be entirely correct.
+//
+// e.g. GPL in an MIT project might only apply to the contrib/ directory.
+//
+// Please consider splitting the single license below into multiple licenses,
+// taking care not to lose any license_kind information, and overriding the
+// default license using the 'licenses: [...]' property on targets as needed.
+//
+// For unused files, consider creating a 'fileGroup' with "//visibility:private"
+// to attach the license to, and including a comment whether the files may be
+// used in the current project.
+//
+// large-scale-change included anything that looked like it might be a license
+// text as a license_text. e.g. LICENSE, NOTICE, COPYING etc.
+//
+// Please consider removing redundant or irrelevant files from 'license_text:'.
+// See: http://go/android-license-faq
+license {
+    name: "external_virglrenderer_license",
+    visibility: [":__subpackages__"],
+    license_kinds: [
+        "SPDX-license-identifier-BSD",
+        "SPDX-license-identifier-BSL-1.0",
+        "SPDX-license-identifier-MIT",
+    ],
+    license_text: [
+        "COPYING",
+        "LICENSE",
+        "NOTICE",
+    ],
+}
+
+cc_library_headers {
+    name: "virgl_headers",
+    host_supported: true,
+    export_include_dirs: ["src"],
+}
+
+cc_library {
+    name: "libvirglrenderer",
+    host_supported: true,
+    // crosvm is arm64 only; the Vulkan callback types in vkr do not even compile for armv7.
+    compile_multilib: "64",
+
+    // This project's unreachable() macro conflicts with the C23 one.
+    c_std: "gnu17",
+
+    // DRM native context backend (src/drm) needs libdrm's xf86drm.h ioctl wrappers
+    // on every target, not just the host glibc build below.
+    header_libs: ["libdrm_headers"],
+
+    cflags: [
+        "-DHAVE_CONFIG_H",
+        "-include prebuilt-intermediates/config.h",
+        "-Wno-unused-parameter",
+        // Neptune builds against directx-native's shared-resource contract (what the
+        // current osy/dxvk exports), not the pre-2026-10-14 dxvk_shared_resource.h.
+        "-DNPT_DXN_SHARED=1",
+    ],
+    // vrend_winsys_gbm.h includes <gbm.h> (the gbm winsys itself is stubbed out); a plain
+    // include dir, not minigbm_headers, because that module is not apex_available.
+    include_dirs: ["external/minigbm"],
+    local_include_dirs: [
+        "prebuilt-intermediates",
+        // vkr_*_gen.h: one-shot output of src/venus/vkr_device_object.py, checked in
+        // like u_format_table.c because Soong does not run the meson custom_target.
+        "prebuilt-intermediates/venus",
+        // u_format_gen.h, u_format_table.c, virgl-version.h (see generate-prebuilts.sh)
+        "prebuilt-intermediates/src",
+        "src",
+        "src/drm",
+        // vendored uapi (newer than AOSP libdrm's): vkr needs
+        // VIRTGPU_DRM_CAPSET_* from virtgpu_drm.h
+        "src/drm/drm-uapi",
+        "src/gallium/auxiliary",
+        "src/gallium/auxiliary/util",
+        "src/gallium/include",
+        "src/mesa",
+        "src/mesa/compat",
+        "src/mesa/pipe",
+        "src/mesa/util",
+        "src/venus",
+        "src/neptune",
+        // directx-native shared-resource header for npt_shared.c (see compat/README)
+        "compat",
+    ],
+    srcs: [
+        "prebuilt-intermediates/src/u_format_table.c",
+        "src/gallium/auxiliary/cso_cache/cso_cache.c",
+        "src/gallium/auxiliary/cso_cache/cso_hash.c",
+        "src/gallium/auxiliary/tgsi/tgsi_build.c",
+        "src/gallium/auxiliary/tgsi/tgsi_dump.c",
+        "src/gallium/auxiliary/tgsi/tgsi_info.c",
+        "src/gallium/auxiliary/tgsi/tgsi_iterate.c",
+        "src/gallium/auxiliary/tgsi/tgsi_parse.c",
+        "src/gallium/auxiliary/tgsi/tgsi_sanity.c",
+        "src/gallium/auxiliary/tgsi/tgsi_scan.c",
+        "src/gallium/auxiliary/tgsi/tgsi_strings.c",
+        "src/gallium/auxiliary/tgsi/tgsi_text.c",
+        "src/gallium/auxiliary/tgsi/tgsi_util.c",
+        "src/gallium/auxiliary/util/u_debug_describe.c",
+        "src/gallium/auxiliary/util/u_format.c",
+        "src/gallium/auxiliary/util/u_hash_table.c",
+        "src/gallium/auxiliary/util/u_texture.c",
+        "src/mesa/util/anon_file.c",
+        "src/mesa/util/bitscan.c",
+        "src/mesa/util/hash_table.c",
+        "src/mesa/util/os_file.c",
+        "src/mesa/util/os_misc.c",
+        "src/mesa/util/ralloc.c",
+        "src/mesa/util/u_cpu_detect.c",
+        "src/mesa/util/u_debug.c",
+        "src/mesa/util/u_math.c",
+        "src/virgl_context.c",
+        "src/virgl_fence.c",
+        "src/virgl_resource.c",
+        "src/virgl_shm_pool.c",
+        "src/virgl_util.c",
+        "src/virglrenderer.c",
+        "src/vrend/iov.c",
+        "src/vrend/vrend_blitter.c",
+        "src/vrend/vrend_debug.c",
+        "src/vrend/vrend_decode.c",
+        "src/vrend/vrend_formats.c",
+        "src/vrend/vrend_object.c",
+        "src/vrend/vrend_renderer.c",
+        "src/vrend/vrend_shader.c",
+        "src/vrend/vrend_tweaks.c",
+        "src/vrend/vrend_winsys.c",
+        "src/vrend/vrend_winsys_egl.c",
+        "src/vrend/vrend_winsys_gbm_stubs.c",
+        "src/venus/vkr_acceleration_structure.c",
+        "src/venus/vkr_allocator.c",
+        "src/venus/vkr_buffer.c",
+        "src/venus/vkr_command_buffer.c",
+        "src/venus/vkr_common.c",
+        "src/venus/vkr_context.c",
+        "src/venus/vkr_cs.c",
+        "src/venus/vkr_descriptor_heap.c",
+        "src/venus/vkr_descriptor_set.c",
+        "src/venus/vkr_device.c",
+        "src/venus/vkr_device_memory.c",
+        "src/venus/vkr_host_copy.c",
+        "src/venus/vkr_image.c",
+        "src/venus/vkr_instance.c",
+        "src/venus/vkr_library.c",
+        "src/venus/vkr_physical_device.c",
+        "src/venus/vkr_pipeline.c",
+        "src/venus/vkr_query_pool.c",
+        "src/venus/vkr_queue.c",
+        "src/venus/vkr_render_pass.c",
+        "src/venus/vkr_renderer.c",
+        "src/venus/vkr_ring.c",
+        "src/venus/vkr_transport.c",
+        "src/venus/vkr_virgl_adapter.c",
+        "src/neptune/npt_common.c",
+        "src/neptune/npt_heap12.c",
+        "src/neptune/npt_hostmem.c",
+        "src/neptune/npt_overrides_d3d12_device.c",
+        "src/neptune/npt_overrides_d3d12_fence.c",
+        "src/neptune/npt_context.c",
+        "src/neptune/npt_cs.c",
+        "src/neptune/npt_feedback.c",
+        "src/neptune/npt_event.c",
+        "src/neptune/npt_library.c",
+        "src/neptune/npt_profile.c",
+        "src/neptune/npt_overrides_d3d11_fence.c",
+        "src/neptune/npt_overrides_d3d11_query.c",
+        "src/neptune/npt_queue.c",
+        "src/neptune/npt_job.c",
+        "src/neptune/npt_renderer.c",
+        "src/neptune/npt_resource.c",
+        "src/neptune/npt_shared.c",
+        "src/neptune/npt_ring.c",
+        "src/neptune/npt_dispatch.c",
+        "src/neptune/npt_overrides_toplevel.c",
+        "src/neptune/npt_overrides_shared_handle.c",
+        "src/drm/drm_context.c",
+        "src/drm/drm_fence.c",
+        "src/drm/drm_renderer.c",
+        "src/drm/drm_util.c",
+        "src/drm/drm2kgsl/drm2kgsl_renderer.c",
+        "src/proxy/proxy_client.c",
+        "src/proxy/proxy_common.c",
+        "src/proxy/proxy_context.c",
+        "src/proxy/proxy_renderer.c",
+        "src/proxy/proxy_server.c",
+        "src/proxy/proxy_socket.c",
+    ],
+    target: {
+        host_linux: {
+            shared_libs: [
+                "libepoxy",
+            ],
+        },
+        linux_glibc: {
+            cflags: [
+                "-Wno-#warnings",
+                // FIXME: Figure out how to get C protos for asprintf,
+                // pthread_setname_np and sched_getcpu from glibc sysroot
+                "-Wno-error=implicit-function-declaration",
+            ],
+            // Avoid linking to another host copy of libdrm; this library will cause
+            // binary GPU drivers to be loaded from the host, which might be linked
+            // to a system copy of libdrm, which conflicts with the AOSP one
+            allow_undefined_symbols: true,
+            header_libs: ["libdrm_headers"],
+            exclude_shared_libs: [
+                "libdrm",
+            ],
+        },
+        linux_bionic: {
+            cflags: [
+                // Provide a C proto for memfd_create
+                "-D__USE_GNU",
+                "-DHAVE_MEMFD_CREATE=1",
+            ],
+        },
+        android: {
+            cflags: [
+                // Provide a C proto for memfd_create
+                "-D__USE_GNU",
+                "-DHAVE_MEMFD_CREATE=1",
+            ],
+            shared_libs: [
+                "libcutils",
+                "liblog",
+            ],
+            static_libs: [
+                "libepoxy",
+            ],
+        },
+    },
+    apex_available: [
+        "//apex_available:platform",
+        "com.android.virt",
+    ],
+}
+
+// The Neptune render server: a forked worker process per context, started by crosvm
+// (--gpu-render-server) or by libvirglrenderer's proxy.  It needs no GL/Vulkan/DRM of its
+// own -- it only hosts the dlopen()ed DXVK (libd3d11.so, libdxgi.so, optionally
+// libvkd3d-proton-d3d12.so; NPT_*_LIBRARY_PATH overrides).  Sandboxing is off: workers are
+// plain fork()s (render-server-worker=process); minijail/seccomp are not compiled in.
+cc_binary {
+    name: "virgl_render_server",
+    host_supported: false,
+    compile_multilib: "64",
+    c_std: "gnu17",
+    header_libs: ["libdrm_headers"],
+    cflags: [
+        "-DHAVE_CONFIG_H",
+        "-include prebuilt-intermediates/config-server.h",
+        "-Wno-unused-parameter",
+        "-DNPT_DXN_SHARED=1",
+        "-D__USE_GNU",
+        "-DHAVE_MEMFD_CREATE=1",
+    ],
+    // vrend_winsys_gbm.h includes <gbm.h> (the gbm winsys itself is stubbed out); a plain
+    // include dir, not minigbm_headers, because that module is not apex_available.
+    include_dirs: ["external/minigbm"],
+    local_include_dirs: [
+        "prebuilt-intermediates",
+        // vkr_*_gen.h: one-shot output of src/venus/vkr_device_object.py, checked in
+        // like u_format_table.c because Soong does not run the meson custom_target.
+        "prebuilt-intermediates/venus",
+        // u_format_gen.h, u_format_table.c, virgl-version.h (see generate-prebuilts.sh)
+        "prebuilt-intermediates/src",
+        "src",
+        "src/drm",
+        // vendored uapi (newer than AOSP libdrm's): vkr needs
+        // VIRTGPU_DRM_CAPSET_* from virtgpu_drm.h
+        "src/drm/drm-uapi",
+        "src/gallium/auxiliary",
+        "src/gallium/auxiliary/util",
+        "src/gallium/include",
+        "src/mesa",
+        "src/mesa/compat",
+        "src/mesa/pipe",
+        "src/mesa/util",
+        "src/venus",
+        "src/neptune",
+        // directx-native shared-resource header for npt_shared.c (see compat/README)
+        "compat",
+        "server",
+    ],
+    srcs: [
+        "prebuilt-intermediates/src/u_format_table.c",
+        "src/mesa/util/anon_file.c",
+        "src/mesa/util/bitscan.c",
+        "src/mesa/util/hash_table.c",
+        "src/mesa/util/os_file.c",
+        "src/mesa/util/os_misc.c",
+        "src/mesa/util/ralloc.c",
+        "src/mesa/util/u_cpu_detect.c",
+        "src/mesa/util/u_debug.c",
+        "src/mesa/util/u_math.c",
+        "src/venus/vkr_acceleration_structure.c",
+        "src/venus/vkr_allocator.c",
+        "src/venus/vkr_buffer.c",
+        "src/venus/vkr_command_buffer.c",
+        "src/venus/vkr_common.c",
+        "src/venus/vkr_context.c",
+        "src/venus/vkr_cs.c",
+        "src/venus/vkr_descriptor_heap.c",
+        "src/venus/vkr_descriptor_set.c",
+        "src/venus/vkr_device.c",
+        "src/venus/vkr_device_memory.c",
+        "src/venus/vkr_host_copy.c",
+        "src/venus/vkr_image.c",
+        "src/venus/vkr_instance.c",
+        "src/venus/vkr_library.c",
+        "src/venus/vkr_physical_device.c",
+        "src/venus/vkr_pipeline.c",
+        "src/venus/vkr_query_pool.c",
+        "src/venus/vkr_queue.c",
+        "src/venus/vkr_render_pass.c",
+        "src/venus/vkr_renderer.c",
+        "src/venus/vkr_ring.c",
+        "src/venus/vkr_transport.c",
+        "src/virgl_shm_pool.c",
+        "src/virgl_util.c",
+        "src/virgl_fence.c",
+        "src/neptune/npt_common.c",
+        "src/neptune/npt_heap12.c",
+        "src/neptune/npt_hostmem.c",
+        "src/neptune/npt_overrides_d3d12_device.c",
+        "src/neptune/npt_overrides_d3d12_fence.c",
+        "src/neptune/npt_context.c",
+        "src/neptune/npt_cs.c",
+        "src/neptune/npt_feedback.c",
+        "src/neptune/npt_event.c",
+        "src/neptune/npt_library.c",
+        "src/neptune/npt_profile.c",
+        "src/neptune/npt_overrides_d3d11_fence.c",
+        "src/neptune/npt_overrides_d3d11_query.c",
+        "src/neptune/npt_queue.c",
+        "src/neptune/npt_job.c",
+        "src/neptune/npt_renderer.c",
+        "src/neptune/npt_resource.c",
+        "src/neptune/npt_shared.c",
+        "src/neptune/npt_ring.c",
+        "src/neptune/npt_dispatch.c",
+        "src/neptune/npt_overrides_toplevel.c",
+        "src/neptune/npt_overrides_shared_handle.c",
+        "server/main.c",
+        "server/render_client.c",
+        "server/render_common.c",
+        "server/render_context.c",
+        "server/render_server.c",
+        "server/render_socket.c",
+        "server/render_state.c",
+        "server/render_worker.c",
+    ],
+    shared_libs: ["libcutils", "liblog"],
+    // Lives next to crosvm in usr/bin of the DroidVM prebuilt tree; its libs are in ../lib
+    // (and next to it in a flat crosvm_out/).
+    ldflags: ["-Wl,-rpath,$ORIGIN:$ORIGIN/../lib"],
+}
