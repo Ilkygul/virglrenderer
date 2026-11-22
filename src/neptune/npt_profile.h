@@ -61,6 +61,8 @@ extern struct npt_profile npt_profile;
 
 void npt_profile_init(void);
 uint64_t npt_profile_now_ns(void);
+void npt_profile_log_fence_stage(const char *stage, uint32_t ctx_id,
+                                 uint32_t ring_idx, uint64_t fence_id);
 void npt_profile_dump(const char *reason);
 
 void npt_profile_register_ring(struct npt_ring *ring);

@@ -177,6 +177,18 @@ npt_profile_dump(const char *reason)
 }
 
 void
+npt_profile_log_fence_stage(const char *stage, uint32_t ctx_id,
+                             uint32_t ring_idx, uint64_t fence_id)
+{
+   if (!NPT_DEBUG(FENCE_TRACE))
+      return;
+
+   const uint64_t now = npt_profile_now_ns();
+   npt_log("NPT-FENCE-STAGE stage=%s ctx=%u ring=%u id=%" PRIu64
+           " mono_ns=%" PRIu64, stage, ctx_id, ring_idx, fence_id, now);
+}
+
+void
 npt_profile_log_q_retire(uint32_t ring_idx, uint64_t fence_id,
                          int sync_fd, uint64_t poll_us, int rc)
 {

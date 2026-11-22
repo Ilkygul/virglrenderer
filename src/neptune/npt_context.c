@@ -1601,6 +1601,7 @@ npt_context_submit_fence(struct npt_context *ctx,
     * first; pop the ARM or park the fence atomically.  Retiring on a
     * miss is not an option -- it completes the guest's fence wait before
     * the GPU work has run. */
+   npt_profile_log_fence_stage("submit", ctx->ctx_id, ring_idx, fence_id);
    struct npt_event_paired paired;
    int sync_fd = npt_event_pop_arm_or_park_fence(ctx, ring_idx, fence_id,
                                                  &paired);
@@ -1623,6 +1624,7 @@ npt_context_pair_event_fence(struct npt_context *ctx,
                              uint32_t ring_idx, uint64_t fence_id,
                              const struct npt_event_paired *paired)
 {
+   npt_profile_log_fence_stage("pair", ctx->ctx_id, ring_idx, fence_id);
    int sync_fd = paired->fd;
    /* No vkGetDeviceQueue2 equivalent: create the sync queue on
     * first use for a given ring_idx. */

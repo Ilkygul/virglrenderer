@@ -94,6 +94,8 @@ npt_queue_free_sync(struct npt_queue_sync *sync)
 static inline void
 npt_queue_sync_retire(struct npt_queue *queue, struct npt_queue_sync *sync)
 {
+   npt_profile_log_fence_stage("callback", queue->context->ctx_id,
+                               sync->ring_idx, sync->fence_id);
    queue->context->retire_fence(queue->context->ctx_id,
                                  sync->ring_idx, sync->fence_id);
    /* The arm's proxy reference was transferred to this entry at
@@ -126,6 +128,7 @@ npt_queue_sync_submit(struct npt_queue *queue,
       return false;
    }
 
+   npt_profile_log_fence_stage("enqueue", queue->context->ctx_id, ring_idx, fence_id);
    /* Append to the queue's sync list and wake the worker. */
    mtx_lock(&queue->sync_thread.mutex);
    list_addtail(&sync->head, &queue->sync_thread.syncs);
@@ -211,6 +214,8 @@ npt_queue_thread(void *arg)
       struct timespec t0, t1;
       const bool trace = NPT_DEBUG(FENCE_TRACE);
       if (trace) {
+         npt_profile_log_fence_stage("head", queue->context->ctx_id,
+                                     sync->ring_idx, sync->fence_id);
          clock_gettime(CLOCK_MONOTONIC, &t0);
          t1 = t0;
       }
