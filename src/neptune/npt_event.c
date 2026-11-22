@@ -370,6 +370,8 @@ npt_event_arm(struct npt_context *ctx, uint64_t token, uint32_t ring_idx,
    if (!token)
       return false;
 
+   const bool trace_arm = NPT_DEBUG(FENCE_TRACE);
+   const uint64_t arm_entry = trace_arm ? npt_profile_now_ns() : 0;
    const bool auto_release = (arm_flags & NPT_EVENT_ARM_FLAG_AUTO_RELEASE) != 0;
 
    mtx_lock(&ctx->event_mutex);
@@ -429,6 +431,12 @@ npt_event_arm(struct npt_context *ctx, uint64_t token, uint32_t ring_idx,
          .fd = dup_fd,
          .release_proxy = pr,
       };
+      if (trace_arm) {
+         npt_log("NPT-ARM-HANDLER ctx=%u ring=%u id=%" PRIu64
+                 " entry_ns=%" PRIu64 " ready_ns=%" PRIu64,
+                 ctx->ctx_id, ring_idx, parked->fence_id, arm_entry,
+                 npt_profile_now_ns());
+      }
       event_pair_parked(ctx, parked, &paired);
       return true;
    }

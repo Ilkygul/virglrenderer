@@ -350,6 +350,10 @@ npt_ring_submit_cmd(struct npt_ring *ring,
    const bool prof_enabled = npt_profile_enabled();
    npt_profile_record_read(&ring->profile, (uint32_t)size);
 
+   const bool trace_arm = NPT_DEBUG(FENCE_TRACE);
+   const uint64_t batch_start = trace_arm ? npt_profile_now_ns() : 0;
+   uint32_t command_count = 0;
+
    while (npt_cs_decoder_has_command(dec)) {
       /* Peek for per-method attribution; the dispatcher peeks again. */
       uint32_t cmd_type = 0;
@@ -361,6 +365,21 @@ npt_ring_submit_cmd(struct npt_ring *ring,
          cmd_type = peek.cmd_type;
          job_header = peek;
          if (prof_enabled) t0 = npt_profile_now_ns();
+      }
+
+      if (trace_arm) {
+         if (cmd_type == NPT_TRANSPORT_CMD_TYPE(NPT_TRANSPORT_SUBGROUP_EVENT,
+                                                 NPT_TRANSPORT_EVENT_ARM_FENCE) &&
+             (size_t)(dec->end - dec->cur) >= sizeof(struct npt_cmd_arm_event_fence)) {
+            struct npt_cmd_arm_event_fence arm;
+            npt_cs_decoder_peek(dec, sizeof(arm), &arm, sizeof(arm));
+            const uint64_t now = npt_profile_now_ns();
+            npt_log("NPT-ARM-BATCH ctx=%u method_ring=%" PRIu64 " event_ring=%u"
+                    " now_ns=%" PRIu64 " prior_ns=%" PRIu64 " prior_commands=%u",
+                    ring->context->ctx_id, (uint64_t)ring->id, arm.ring_idx,
+                    now, now - batch_start, command_count);
+         }
+         command_count++;
       }
 
       if (!npt_job_ring_before(ring, &job_header)) return false;
